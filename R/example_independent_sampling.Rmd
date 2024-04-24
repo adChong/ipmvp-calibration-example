@@ -1,0 +1,305 @@
+---
+title: "Example on simulating uncertainties using Monte Carlo simulation"
+author: "Adrian Chong"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+
+# save the built-in output hook
+hook_output <- knitr::knit_hooks$get("output")
+
+# set a new output hook to truncate text output
+knitr::knit_hooks$set(output = function(x, options) {
+  if (!is.null(n <- options$out.lines)) {
+    x <- xfun::split_lines(x)
+    if (length(x) > n) {
+      # truncate the output
+      x <- c(head(x, n), "....\n")
+    }
+    x <- paste(x, collapse = "\n")
+  }
+  hook_output(x, options)
+})
+
+```
+
+## Background
+
+This document presents an example of simulating uncertainties for two independent variables using Monte Carlo simulation. The context for our simulation is based on the Department of Energy (DOE) medium office commercial prototype building models, specifically for climate zone 3C, with San Diego, California, USA, serving as the representative city. The focus is on two specific variables that include the `Lighting Power Density (LPD)` and the `Electric Equipment Power Density (EPD)`. 
+
+
+### Packages and Tools 
+
+In this example, we use EnergyPlus Version 22.1, TMY3 from San Diego Brown Field Municipal Airport weather station (722904), and the following R packages
+
+```{r packages, message=FALSE}
+library(here)
+library(eplusr)
+library(triangulr)
+library(knitr)
+library(tidyverse)
+```
+
+
+## Parsing EnergyPlus into R
+
+This section outlines the process for parsing the EnergyPlus model into R and interfacing with it through R programmatically. 
+
+Begin by specifying the file paths for the EnergyPlus model (`idf_path`)  and the weather files (`epw_path`). 
+
+```{r}
+idf_path <- here("data", "monte_carlo", "ASHRAE901_OfficeMedium_STD2022_SanDiego.idf")
+epw_path <- here("data", "monte_carlo", "USA_CA_San.Deigo-Brown.Field_.Muni_.AP_.722904_TMY3.epw")
+```
+
+Parse the model and the TMY3 weather file into R using the `read_idf` and `read_epw` function from the `eplusr` package. 
+
+```{r}
+idf_model <- read_idf(idf_path)
+epw <- read_epw(epw_path)
+```
+
+
+## Simulating the Base Model
+Run the simulation to obtain the electricity energy use of the base model by calling the run method on the IDF model object, specifying the weather file (`epw`) and a directory for the simulation outputs. Following the completion of the simulation, we retrieve the tabular report data to focus specifically on the annual electricity consumption.
+
+The code filters the simulation outputs to only contain total electricity end use data from the "End Uses" table in the "Annual Building Utility Performance Summary" Report. For energy values reported in Gigajoules (GJ), a conversion factor is applied to convert these into kilowatt-hours (kWh).
+
+```{r, out.lines = 12}
+job <- idf_model$run(weather = epw, dir = tempdir())
+base_report <- job$tabular_data() %>%
+    filter(report_name == "AnnualBuildingUtilityPerformanceSummary",
+           table_name == "End Uses",
+           column_name == "Electricity",
+           row_name == "Total End Uses") %>%
+    mutate(case = map_chr(str_split(case, "_"), 1), 
+           value = as.numeric(value), # convert value to numeric
+           value = ifelse(units == "GJ", value * 277.778, value),
+           units = ifelse(units == "GJ", "kWh", units))
+
+print(base_report)
+```
+
+## Monte Carlo Simulation
+
+### Generating Random Samples
+
+To evaluate the impact of fractional reductions in Lighting Power Density (LPD) and Equipment Power Density (EPD) on the total electricity energy use of the building, it's essential to first model the uncertainties in these parameters. We assume a triangular distribution for both LPD and EPD, characterized by a minimum (min = 0.05), maximum (max = 0.15), and most likely value (mode = 0.10). For illustration, we generate 200 random samples from this distribution for both LPD and EPD, ensuring reproducibility by setting distinct seeds (`seed = 1` for LPD and `seed = 2` for EPD). These samples represent potential variations in power densities that could occur due to different energy conservation measures or design changes.
+
+The following code block creates random samples for LPD (`r_lpd`) using the `rtri` function, specifying the number of samples, and the parameters of the triangular distribution. A histogram, created with `ggplot`, visualizes the distribution of these samples.
+
+```{r}
+n_samples <- 200
+
+set.seed(1)
+r_lpd <- rtri(n = n_samples, min = 0.05, max = 0.15, mode = 0.10)
+
+ggplot(data.frame(x = r_lpd), aes(x)) +
+    geom_histogram(binwidth=0.025, colour="black", fill="#E78AC3") +
+    labs(x = "Fraction Reduction in Lighting Power Density") +
+    scale_x_continuous(breaks=seq(0.025, 0.175, 0.025)) +
+    theme_minimal()
+```
+
+Similarly, the second code block generates random samples for EPD (`r_epd`), again using the `rtri` function with the same distribution parameters but a different seed (`seed = 2`) for variety. 
+
+```{r}
+set.seed(2)
+
+r_epd <- rtri(n = n_samples, min = 0.05, max = 0.15, mode = 0.10)
+
+ggplot(data.frame(x = r_epd), aes(x)) +
+    geom_histogram(binwidth=0.025, colour="black", fill="#FFD92F") +
+    labs(x = "Fraction Reduction in Equipment Power Density") +
+    scale_x_continuous(breaks=seq(0.025, 0.175, 0.025)) +
+    theme_minimal()
+```
+
+### Running the Simulations
+
+In this section, we utilize the energy simulation model to quantify the impact of varying the Lighting Power Density (LPD) and Equipment Power Density (EPD) on the building's total electricity consumption. Each parameter is altered independently, with one variable adjusted per simulation run while the other remains at its base value.
+
+Prior to running the simulations, it is necessary to define functions capable of dynamically adjusting LPD and EPD within the model. The `ecm` function defined below plays such a role in the process. The `set_frac` function is designed to modify parameter values of a specific EnergyPlus object and field. It filters the model by class and field names, then applies a fractional change to the value of the selected parameter. The `ecm` function asjusts the LPD and EPD of the model by invoking the `set_frac` function to apply the specified fractional reductions to both lighting power density (within the "Lights" class, targeting "Watts per Zone Floor Area") and electric equipment design level (within the "ElectricEquipment" class, targeting "Design Level"). 
+
+```{r}
+set_frac <- function(idf, class_value, field_value, frac) {
+     obj <- idf$to_table() %>%
+        filter(class == class_value, field == field_value) %>%
+        mutate(value = as.numeric(value) * frac)
+
+    idf$update(obj)
+
+    idf
+}
+
+ecm <- function(idf, lpd_frac, epd_frac) {
+
+    idf <- set_frac(idf,
+                    "Lights",
+                    "Watts per Zone Floor Area",
+                    lpd_frac)
+
+    idf <- set_frac(idf,
+                    "ElectricEquipment",
+                    "Design Level",
+                    epd_frac)
+
+    idf
+}
+```
+
+
+With the `ecm` function defined, we proceed to initialize the parametric simulations utilizing the `param_job()` function from `eplusr` R package. The `$apply_measure()` method of the parametric model object is employed to generate variants of the base model, each reflecting different combinations of LPD and EPD adjustments. Specifically, two sets of simulations are created: one set explores the effects of reducing LPD (using values from the generated samples `r_lpd`) while maintaining EPD at base values, and the other set does the opposite, reducing EPD (using values from the generated samples `r_epd`) with LPD held constant. 
+
+```{r, message=FALSE}
+param_model <- param_job(idf_model, epw)
+
+param_model$apply_measure(ecm,
+                          lpd_frac = 1-c(r_lpd, rep(0, n_samples)),
+                          epd_frac = 1-c(rep(0, n_samples), r_epd),
+                          .names = c(paste0("lpd_", 1:n_samples), 
+                                     paste0("epd_", 1:n_samples)))
+
+
+```
+
+The following code snippet uses the `$cases()` method to extract and display a summary of the parameter values alongside their corresponding model identifiers. 
+
+```{r}
+param_model$cases()
+```
+
+With the prametric models set up, we use the `$run()` method to initiate running the simulations in parallel. The results from each parametric simulation are stored in individual folders. In this instance, the parametric simulations contains a total of 400 simulations — split evenly with 200 simulations dedicated to exploring the range of LPD adjustments and another 200 for EPD adjustments. 
+
+```{r, message=FALSE, out.lines = 12}
+param_model$run(dir = tempdir())
+```
+
+Following the completion of the simulations, the next steps involve collecting, summarizing, and analyzing the resulting data.
+
+The first step in the post-simulation analysis involves using `$tabular_data()` to extract the EnergyPlus Tabular Output Reports from all completed parametric simulations. This function fetches detailed reports, which are then filtered to focus exclusively on the total electricity usage. The filtering process isolates data from the "End Uses" table within the "Annual Building Utility Performance Summary" report. Electricity values reported in Gigajoules (GJ) are converted to kilowatt-hours (kWh), standardizing all energy usage figures to a consistent unit of measurement.
+
+```{r}
+results <- param_model$tabular_data() %>%
+    filter(report_name == "AnnualBuildingUtilityPerformanceSummary",
+           table_name == "End Uses",
+           column_name == "Electricity",
+           row_name == "Total End Uses") %>%
+    mutate(case = map_chr(str_split(case, "_"), 1), 
+           value = as.numeric(value), # convert value to numeric
+           value = ifelse(units == "GJ", value * 277.778, value),
+           units = ifelse(units == "GJ", "kWh", units))
+
+    
+```
+
+With the results preprocessed, the next step involves computing summary statistics for the total electricity end use across all simulation cases. This analysis leverages the `group_by` and `summarize` functions to calculate various statistical measures, including mean, standard deviation, minimum, maximum, median, quartiles, and the interquartile range (IQR). These statistics provide a comprehensive overview of the simulation results, highlighting variations in electricity usage due to adjustments in LPD and EPD.
+
+```{r}
+results_stats <- results %>%
+  group_by(case) %>%
+  summarize(
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    min = min(value, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    percentile_25th = quantile(value, 0.25, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    percentile_75th = quantile(value, 0.75, na.rm = TRUE),
+    iqr = IQR(value, na.rm = TRUE)
+  )
+
+print(results_stats)
+```
+
+To visually compare the outcomes, a histogram overlaid with density plots is created using `ggplot`, illustrating the density and distribution of energy usage values for different cases. The histograms are color-coded, with LPD modifications in pink (`"#E78AC3"`) and EPD modifications in yellow (`"#FFD92F"`).
+
+```{r}
+ggplot(results, aes(x = value, fill = case)) +
+    geom_histogram(aes(y=..density..), colour = "black") +
+    geom_density(aes(color = case), alpha = 0.2) +
+    scale_fill_manual(values = c("lpd" = "#E78AC3", "epd" = "#FFD92F")) +
+    scale_color_manual(values = c("lpd" = "#E78AC3", "epd" = "#FFD92F")) +
+    theme_minimal() +
+    labs(x = "Total electricity end uses (kWh)",
+         y = "Density") +
+    theme(legend.title = element_blank()) +
+    geom_vline(xintercept = base_report$value, color = "red", linetype = "dashed", size = 1) +
+    annotate("text", x = base_report$value, y = 1.5e-04, 
+             label = paste("Base Model (", round(base_report$value)," kWh)", sep = ""), 
+             color = "red", angle = 90, vjust = -0.5)
+```
+
+### Simulating Combined Adjustments
+
+In the previous example, we simulated the effects of varying LPD and EPD independently. In this example we simulate varying both LPD and EPD simultaneously. 
+
+We begin by setting up a new parametric simulation environment, `param_model_combined` to investigate the simultaneous variations in LPD and EPD. Notably, when LPD and EPD are varied together, the total number of simulations required decreases compared to the separate analysis of each parameter. The simulations leverage the same sets of random variables (`r_lpd` and `r_epd`) previously generated from triangular distributions.
+
+The param_model_combined is configured to apply the ecm function across all simulations, adjusting both LPD and EPD according to the pre-generated random variables. This dual modification is encapsulated in a single parametric intervention, represented by the .names attribute, which systematically labels each simulation scenario for clarity and tracking.
+
+```{r, message=FALSE}
+
+param_model_combined <- param_job(idf_model, epw)
+
+param_model_combined$apply_measure(ecm,
+                                   lpd_frac = 1-r_lpd,
+                                   epd_frac = 1-r_epd,
+                                   .names = c(paste0("combined_", 1:n_samples)))
+```
+
+Following the configuration of the combined simulation, the `$cases()` method is used here to provide a concise overview of the simulation scenarios, detailing the specific adjustments made to LPD and EPD in each case.
+
+```{r}
+param_model_combined$cases()
+```
+
+Utilizing the `$run()` method, a total of 200 parametric simulations are executed, reflecting simultaneous adjustments in LPD and EPD based on the predefined random variables.
+
+```{r, message=FALSE, out.lines = 12}
+param_model_combined$run(dir = tempdir())
+```
+Post-simulation, the `$tabular_data()` method extracts relevant data, focusing on total electricity end use from the "End Uses Table" of the "Annual Building Utility Performance Summary" report. The results undergo standardization to ensure uniform units of measurement.
+
+```{r}
+results_combined <- param_model_combined$tabular_data() %>%
+    filter(report_name == "AnnualBuildingUtilityPerformanceSummary",
+           table_name == "End Uses",
+           column_name == "Electricity",
+           row_name == "Total End Uses") %>%
+    mutate(value = as.numeric(value), # convert value to numeric
+           value = ifelse(units == "GJ", value * 277.778, value),
+           units = ifelse(units == "GJ", "kWh", units))
+```
+
+Summary statistics are calculated for the total electricity end use, encompassing measures such as mean, standard deviation, minimum, maximum, and quartiles. These statistics provide a quantitative basis for assessing the effects of simultaneous adjustments in LPD and EPD on energy consumption.
+
+```{r}
+results_combined_stats <- results_combined %>%
+  summarize(
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    min = min(value, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    percentile_25th = quantile(value, 0.25, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    percentile_75th = quantile(value, 0.75, na.rm = TRUE),
+    iqr = IQR(value, na.rm = TRUE)
+  )
+
+print(results_combined_stats)
+```
+A histogram, supplemented by a density plot, visually represents the distribution of total electricity end uses across simulations. This visualization aids in understanding the variance and central tendency of energy savings when both LPD and EPD are adjusted together, offering a succinct graphical summary of the simulation outcomes.
+
+```{r}
+ggplot(results_combined, aes(x = value)) +
+    geom_histogram(aes(y=..density..), binwidth = 2500, fill = "#B3B3B3", colour = "black") +
+    geom_density(alpha = 0.2) +
+    labs(x = "Total electricity end uses (kWh)") +
+    theme_minimal()
+```
+
+
